@@ -6,8 +6,8 @@ A comprehensive deepfake detection system combining EfficientNetB0 CNN with SVM,
 
 - **EfficientNetB0 CNN**: Feature extraction backbone
 - **Ensemble Learning**: SVM, Random Forest, and KNN classifiers combined with EfficientNetB0 features
-- **Weighted Ensemble Voting**: Dynamic weighting of models achieving 83-85% accuracy (7-8% improvement over single-model baselines)
-- **GradCAM Visualization**: Interpretable localization of facial manipulation artifacts on a 4-block CNN (32→64→128→256 filters)
+- **Weighted Ensemble Voting**: Dynamic per-model weighting based on validation accuracy, combining EfficientNetB0, SVM, Random Forest, and KNN predictions
+- **GradCAM Visualization**: Interpretable localization of facial manipulation artifacts on the EfficientNetB0 backbone (7 MBConv stages, 16→320 channels, 1280-dim pooled feature output)
 - **Robust Training Pipeline**: Early stopping (patience=10), LR scheduling (factor=0.5), 5-fold stratified cross-validation
 - **Batch Inference Engine**: Confidence calibration across 5 deepfake datasets including Celeb-DF and FaceForensics++
 - **Multi-dataset Support**: FaceForensics++ (C23, C40), Celeb-DF, DFDC, WildDeepfake, and DeeperForensics
@@ -119,8 +119,8 @@ python predict.py --input image.jpg --gradcam --output visualization/
 ## Visualization
 
 GradCAM implementation highlights regions contributing to deepfake detection:
-- 4-block CNN architecture: 32→64→128→256 filters
-- Target layer: Last convolutional block
+- EfficientNetB0 backbone: 7 MBConv stages, 16→24→40→80→112→192→320 channels, 1280-dim pooled feature output
+- Target layer: `backbone.conv_head` (last conv layer before global pooling)
 - Overlay heatmap on original images for interpretability
 
 ## Results

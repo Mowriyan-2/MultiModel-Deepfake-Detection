@@ -83,13 +83,25 @@ def load_configurations(args):
 
     return model_config
 
+def resolved_model_config_path(args):
+    """
+    FIX: several call sites used to pass args.model_config directly to model
+    constructors. Since args.model_config defaults to None unless the user
+    explicitly passes --model_config, every one of those constructors was
+    silently falling back to ITS OWN hardcoded defaults instead of reading
+    configs/model_config.yaml - even though load_configurations() elsewhere
+    already knows how to resolve this correctly. Use this helper everywhere
+    a config PATH (not the loaded dict) needs to be passed to a constructor.
+    """
+    return args.model_config or DEFAULT_CONFIG_PATH
+
 def prepare_data(args, device):
     """Prepare datasets for training."""
     logger = logging.getLogger(__name__)
     logger.info("Preparing datasets...")
 
     # Initialize data processor
-    data_processor = DeepfakeDatasetProcessor(args.model_config)
+    data_processor = DeepfakeDatasetProcessor(resolved_model_config_path(args))
 
     # Load dataset based on argument
     if args.dataset == 'faceforensics':
@@ -126,15 +138,19 @@ def train_individual_models(args, device, df, splits, data_processor, model_conf
     from torch.utils.data import DataLoader
 
     # Initialize models
+    # FIX: load_config() nests these under model_config['model']['efficientnetb0'],
+    # not model_config['efficientnetb0'] - the old lookup always returned {}
+    # and silently used the hardcoded defaults regardless of the YAML.
+    effnet_cfg = model_config.get('model', {}).get('efficientnetb0', {})
     efficientnet_model = EfficientNetB0Classifier(
-        pretrained=model_config.get('efficientnetb0', {}).get('pretrained', True),
-        num_classes=model_config.get('efficientnetb0', {}).get('num_classes', 1),
-        dropout_rate=model_config.get('efficientnetb0', {}).get('dropout_rate', 0.3)
+        pretrained=effnet_cfg.get('pretrained', True),
+        num_classes=effnet_cfg.get('num_classes', 1),
+        dropout_rate=effnet_cfg.get('dropout_rate', 0.3)
     ).to(device)
 
-    svm_model = SVMClassifier(args.model_config)
-    rf_model = RandomForestClassifier(args.model_config)
-    knn_model = KNNClassifier(args.model_config)
+    svm_model = SVMClassifier(resolved_model_config_path(args))
+    rf_model = RandomForestClassifier(resolved_model_config_path(args))
+    knn_model = KNNClassifier(resolved_model_config_path(args))
 
     # Store training histories
     histories = {}
@@ -160,7 +176,7 @@ def train_individual_models(args, device, df, splits, data_processor, model_conf
         val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
 
         # Initialize trainers
-        effnet_trainer = ModelTrainer(efficientnet_model, device=device, config_path=args.model_config)
+        effnet_trainer = ModelTrainer(efficientnet_model, device=device, config_path=resolved_model_config_path(args))
         # For traditional ML models, we'll extract features first
 
         # Train EfficientNetB0
@@ -240,7 +256,7 @@ def create_ensemble(args, device, efficientnet_model, feature_extractor, svm_mod
     logger.info("Creating weighted ensemble...")
 
     # Initialize ensemble
-    ensemble = WeightedEnsembleClassifier(args.model_config)
+    ensemble = WeightedEnsembleClassifier(resolved_model_config_path(args))
 
     # The raw EfficientNetB0Classifier has no predict_proba/sklearn-style
     # interface, and it expects raw images rather than the 1280-dim features
