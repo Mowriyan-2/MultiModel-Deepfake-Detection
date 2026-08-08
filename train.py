@@ -172,8 +172,8 @@ def train_individual_models(args, device, df, splits, data_processor, model_conf
 
         # Create data loaders
         batch_size = model_config.get('training', {}).get('batch_size', 32)
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
-        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
 
         # Initialize trainers
         effnet_trainer = ModelTrainer(efficientnet_model, device=device, config_path=resolved_model_config_path(args))
@@ -283,8 +283,8 @@ def create_ensemble(args, device, efficientnet_model, feature_extractor, svm_mod
     val_dataset = DeepfakeDataset(val_df, transform=None)
 
     batch_size = 32
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
 
     # Extract features (for SVM/RF/KNN) using the feature extractor, not the classifier
     logger.info("Extracting features for ensemble training...")
@@ -332,7 +332,7 @@ def evaluate_model(args, device, ensemble, feature_extractor, df, splits, data_p
         val_df = df.iloc[val_idx].reset_index(drop=True)
 
         val_dataset = DeepfakeDataset(val_df, transform=None)
-        val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=4)
+        val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=2)
 
         # Extract features using the same feature extractor (trained backbone)
         # that was used for training — not a freshly re-initialized model,
