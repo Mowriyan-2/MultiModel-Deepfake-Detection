@@ -138,6 +138,7 @@ class KNNClassifier:
                 'algorithm': self.algorithm
             }
         }
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
 
         joblib.dump(model_data, filepath)
         logger.info(f"KNN model saved to {filepath}")

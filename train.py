@@ -162,84 +162,101 @@ def train_individual_models(args, device, df, splits, data_processor, model_conf
 
         logger.info(f"=== Training Fold {fold+1}/{args.n_folds} ===")
 
-        # Split data
-        train_df = df.iloc[train_idx].reset_index(drop=True)
-        val_df = df.iloc[val_idx].reset_index(drop=True)
+        try:
+            # Split data
+            train_df = df.iloc[train_idx].reset_index(drop=True)
+            val_df = df.iloc[val_idx].reset_index(drop=True)
 
-        # Create datasets
-        train_dataset = DeepfakeDataset(train_df, transform=None)
-        val_dataset = DeepfakeDataset(val_df, transform=None)
+            # Create datasets
+            train_dataset = DeepfakeDataset(train_df, transform=None)
+            val_dataset = DeepfakeDataset(val_df, transform=None)
 
-        # Create data loaders
-        batch_size = model_config.get('training', {}).get('batch_size', 32)
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
-        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
+            # Create data loaders
+            batch_size = model_config.get('training', {}).get('batch_size', 32)
+            train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+            val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
 
-        # Initialize trainers
-        effnet_trainer = ModelTrainer(efficientnet_model, device=device, config_path=resolved_model_config_path(args))
-        # For traditional ML models, we'll extract features first
+            # Initialize trainers
+            effnet_trainer = ModelTrainer(efficientnet_model, device=device, config_path=resolved_model_config_path(args))
+            # For traditional ML models, we'll extract features first
 
-        # Train EfficientNetB0
-        logger.info("Training EfficientNetB0...")
-        start_time = time.time()
-        effnet_history = effnet_trainer.fit(train_loader, val_loader,
-                                          epochs=model_config.get('training', {}).get('epochs', 50),
-                                          save_dir=os.path.join(args.model_dir, f'efficientnetb0/fold_{fold+1}') if args.save_models else None)
-        effnet_time = time.time() - start_time
-        logger.info(f"EfficientNetB0 training completed in {format_time(effnet_time)}")
+            # Train EfficientNetB0
+            logger.info("Training EfficientNetB0...")
+            start_time = time.time()
+            effnet_history = effnet_trainer.fit(train_loader, val_loader,
+                                              epochs=model_config.get('training', {}).get('epochs', 50),
+                                              save_dir=os.path.join(args.model_dir, f'efficientnetb0/fold_{fold+1}') if args.save_models else None)
+            effnet_time = time.time() - start_time
+            logger.info(f"EfficientNetB0 training completed in {format_time(effnet_time)}")
 
-        # Extract features for traditional ML models
-        logger.info("Extracting features for traditional ML models...")
-        from src.feature_extraction import extract_features
+            # Extract features for traditional ML models
+            logger.info("Extracting features for traditional ML models...")
+            from src.feature_extraction import extract_features
 
-        # SVM/RF/KNN need the pooled 1280-dim EfficientNetB0 features, not the
-        # classifier's logits — build a feature extractor that shares the
-        # just-trained backbone weights rather than feeding it the classifier.
-        feature_extractor = EfficientNetB0FeatureExtractor(pretrained=False)
-        feature_extractor.backbone.load_state_dict(efficientnet_model.backbone.state_dict())
-        feature_extractor.to(device).eval()
+            # SVM/RF/KNN need the pooled 1280-dim EfficientNetB0 features, not the
+            # classifier's logits — build a feature extractor that shares the
+            # just-trained backbone weights rather than feeding it the classifier.
+            feature_extractor = EfficientNetB0FeatureExtractor(pretrained=False)
+            feature_extractor.backbone.load_state_dict(efficientnet_model.backbone.state_dict())
+            feature_extractor.to(device).eval()
 
-        # Get features for training
-        train_features, train_labels = extract_features(feature_extractor, train_loader, device)
-        val_features, val_labels = extract_features(feature_extractor, val_loader, device)
+            # Get features for training
+            train_features, train_labels = extract_features(feature_extractor, train_loader, device)
+            val_features, val_labels = extract_features(feature_extractor, val_loader, device)
 
-        # Train SVM
-        logger.info("Training SVM...")
-        start_time = time.time()
-        svm_model.fit(train_features, train_labels)
-        svm_time = time.time() - start_time
-        logger.info(f"SVM training completed in {format_time(svm_time)}")
+            # Train SVM
+            logger.info("Training SVM...")
+            start_time = time.time()
+            svm_model.fit(train_features, train_labels)
+            svm_time = time.time() - start_time
+            logger.info(f"SVM training completed in {format_time(svm_time)}")
 
-        # Train Random Forest
-        logger.info("Training Random Forest...")
-        start_time = time.time()
-        rf_model.fit(train_features, train_labels)
-        rf_time = time.time() - start_time
-        logger.info(f"Random Forest training completed in {format_time(rf_time)}")
+            # Train Random Forest
+            logger.info("Training Random Forest...")
+            start_time = time.time()
+            rf_model.fit(train_features, train_labels)
+            rf_time = time.time() - start_time
+            logger.info(f"Random Forest training completed in {format_time(rf_time)}")
 
-        # Train KNN
-        logger.info("Training KNN...")
-        start_time = time.time()
-        knn_model.fit(train_features, train_labels)
-        knn_time = time.time() - start_time
-        logger.info(f"KNN training completed in {format_time(knn_time)}")
+            # Train KNN
+            logger.info("Training KNN...")
+            start_time = time.time()
+            knn_model.fit(train_features, train_labels)
+            knn_time = time.time() - start_time
+            logger.info(f"KNN training completed in {format_time(knn_time)}")
 
-        # Store histories
-        histories[f'fold_{fold+1}'] = {
-            'efficientnetb0': effnet_history,
-            'svm_time': svm_time,
-            'rf_time': rf_time,
-            'knn_time': knn_time,
-            'effnet_time': effnet_time
-        }
+            # Store histories
+            histories[f'fold_{fold+1}'] = {
+                'efficientnetb0': effnet_history,
+                'svm_time': svm_time,
+                'rf_time': rf_time,
+                'knn_time': knn_time,
+                'effnet_time': effnet_time
+            }
 
-        # Save models if requested
-        if args.save_models:
-            # Save EfficientNetB0
-            effnet_path = os.path.join(args.model_dir, f'efficientnetb0/fold_{fold+1}', 'model_best.pth')
-            if os.path.exists(effnet_path):
-                # Already saved by trainer
-                pass
+            # Save models if requested
+            if args.save_models:
+                # Save EfficientNetB0
+                effnet_path = os.path.join(args.model_dir, f'efficientnetb0/fold_{fold+1}', 'model_best.pth')
+                if os.path.exists(effnet_path):
+                    # Already saved by trainer
+                    pass
+
+                # Save traditional ML models
+                svm_model.save_model(os.path.join(args.model_dir, f'svm/fold_{fold+1}', 'svm_model.pkl'))
+                rf_model.save_model(os.path.join(args.model_dir, f'random_forest/fold_{fold+1}', 'rf_model.pkl'))
+                knn_model.save_model(os.path.join(args.model_dir, f'knn/fold_{fold+1}', 'knn_model.pkl'))
+
+            logger.info(f"Fold {fold+1} completed")
+
+        except Exception as e:
+            # FIX: previously an exception anywhere in a fold (e.g. the missing-
+            # directory save bug) propagated straight out of this loop and killed
+            # the entire cross-validation run, throwing away every already-
+            # completed fold. Now one bad fold is logged and skipped so the
+            # remaining folds still run and whatever did succeed still counts.
+            logger.error(f"Fold {fold+1} failed: {e}", exc_info=True)
+            continue
 
             # Save traditional ML models
             svm_model.save_model(os.path.join(args.model_dir, f'svm/fold_{fold+1}', 'svm_model.pkl'))
@@ -283,8 +300,8 @@ def create_ensemble(args, device, efficientnet_model, feature_extractor, svm_mod
     val_dataset = DeepfakeDataset(val_df, transform=None)
 
     batch_size = 32
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
 
     # Extract features (for SVM/RF/KNN) using the feature extractor, not the classifier
     logger.info("Extracting features for ensemble training...")
@@ -332,7 +349,7 @@ def evaluate_model(args, device, ensemble, feature_extractor, df, splits, data_p
         val_df = df.iloc[val_idx].reset_index(drop=True)
 
         val_dataset = DeepfakeDataset(val_df, transform=None)
-        val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=2)
+        val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=4)
 
         # Extract features using the same feature extractor (trained backbone)
         # that was used for training — not a freshly re-initialized model,

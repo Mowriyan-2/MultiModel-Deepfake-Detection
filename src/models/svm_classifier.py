@@ -143,6 +143,7 @@ class SVMClassifier:
                 'probability': self.probability
             }
         }
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
 
         joblib.dump(model_data, filepath)
         logger.info(f"SVM model saved to {filepath}")

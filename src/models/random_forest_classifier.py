@@ -144,6 +144,7 @@ class RandomForestClassifier:
                 'min_samples_leaf': self.min_samples_leaf
             }
         }
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
 
         joblib.dump(model_data, filepath)
         logger.info(f"Random Forest model saved to {filepath}")
