@@ -40,10 +40,10 @@ training:
   weight_decay: 1.0e-4
   batch_size: 32
   epochs: 50
-  early_stopping_patience: 10
+  early_stopping_patience: 4
   early_stopping_min_delta: 0.001
   lr_scheduler_factor: 0.5
-  lr_scheduler_patience: 5
+  lr_scheduler_patience: 2
   min_lr: 1.0e-7
 
 # Image preprocessing
