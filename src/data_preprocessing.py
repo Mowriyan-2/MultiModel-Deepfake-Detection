@@ -9,7 +9,7 @@ import pandas as pd
 from PIL import Image
 import torch
 from torchvision import transforms
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedGroupKFold
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import logging
@@ -66,7 +66,9 @@ class DeepfakeDatasetProcessor:
             compression: Compression level ('c23' or 'c40')
 
         Returns:
-            DataFrame with image paths and labels
+            DataFrame with image paths, labels, and a video_id column
+            (video_id is used downstream to split at the video level instead
+            of the frame level — see create_stratified_splits).
         """
         data = []
 
@@ -82,7 +84,11 @@ class DeepfakeDatasetProcessor:
                                 'image_path': os.path.join(video_path, frame_file),
                                 'label': 0,  # Real
                                 'dataset': 'faceforensics',
-                                'compression': compression
+                                'compression': compression,
+                                # Prefixed with 'real' so a real video's ID can never
+                                # collide with a fake video that happens to share a
+                                # source-video filename under a different method.
+                                'video_id': f"real_{video_folder}"
                             })
 
         # Fake videos (Deepfakes, Face2Face, FaceSwap, NeuralTextures)
@@ -100,7 +106,8 @@ class DeepfakeDatasetProcessor:
                                     'label': 1,  # Fake
                                     'dataset': 'faceforensics',
                                     'compression': compression,
-                                    'method': method
+                                    'method': method,
+                                    'video_id': f"{method}_{video_folder}"
                                 })
 
         df = pd.DataFrame(data)
@@ -116,7 +123,8 @@ class DeepfakeDatasetProcessor:
             data_path: Path to Celeb-DF dataset
 
         Returns:
-            DataFrame with image paths and labels
+            DataFrame with image paths, labels, and a video_id column
+            (see load_faceforensics_data docstring for why this matters).
         """
         data = []
 
@@ -131,7 +139,8 @@ class DeepfakeDatasetProcessor:
                             data.append({
                                 'image_path': os.path.join(video_path, frame_file),
                                 'label': 0,  # Real
-                                'dataset': 'celebdf'
+                                'dataset': 'celebdf',
+                                'video_id': f"real_{video_folder}"
                             })
 
         # Fake videos
@@ -145,7 +154,8 @@ class DeepfakeDatasetProcessor:
                             data.append({
                                 'image_path': os.path.join(video_path, frame_file),
                                 'label': 1,  # Fake
-                                'dataset': 'celebdf'
+                                'dataset': 'celebdf',
+                                'video_id': f"fake_{video_folder}"
                             })
 
         df = pd.DataFrame(data)
@@ -155,20 +165,36 @@ class DeepfakeDatasetProcessor:
 
     def create_stratified_splits(self, df, n_folds=5, random_state=42):
         """
-        Create stratified k-fold splits.
+        Create stratified k-fold splits, grouped by video.
+
+        BUG FIX: the previous implementation ran StratifiedKFold directly on
+        the frame-level dataframe, which let frames from the same video land
+        in both the train and validation split of a fold. Since frames from
+        one video are near-duplicates, that let the model "recognize" videos
+        it had already partially seen, inflating validation accuracy. This
+        version uses StratifiedGroupKFold with video_id as the group, so every
+        frame of a given video is guaranteed to land entirely in either train
+        or val for a given fold, never split across both.
 
         Args:
-            df: DataFrame with image paths and labels
+            df: DataFrame with image paths, labels, and a 'video_id' column
             n_folds: Number of folds
             random_state: Random seed
 
         Returns:
             List of (train_indices, val_indices) tuples
         """
-        skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=random_state)
+        if 'video_id' not in df.columns:
+            raise ValueError(
+                "DataFrame is missing a 'video_id' column — group-aware "
+                "splitting requires it. If you're loading data through a "
+                "custom loader, add a 'video_id' column before calling this."
+            )
+
+        sgkf = StratifiedGroupKFold(n_splits=n_folds, shuffle=True, random_state=random_state)
         splits = []
 
-        for train_idx, val_idx in skf.split(df['image_path'], df['label']):
+        for train_idx, val_idx in sgkf.split(df['image_path'], df['label'], groups=df['video_id']):
             splits.append((train_idx, val_idx))
 
         return splits

@@ -201,20 +201,36 @@ class WeightedEnsembleClassifier(BaseEstimator, ClassifierMixin):
         return np.argmax(probs, axis=1)
 
     def update_weights(self, val_X_features: Optional[np.ndarray] = None,
-                        val_y: np.ndarray = None, val_X_images=None):
+                        val_y: np.ndarray = None, val_X_images=None,
+                        precomputed_accuracies: Optional[Dict[str, float]] = None):
         """
         Update model weights based on validation performance.
 
         Args:
             val_X_features: Validation feature matrix for sklearn-style models
             val_y: Validation target vector
-            val_X_images: Validation image batch for the CNN adapter model
+            val_X_images: Validation image batch for the CNN adapter model.
+                Rarely worth supplying directly (holding a full validation
+                set of raw images in memory is expensive) — prefer
+                precomputed_accuracies for image-input models instead.
+            precomputed_accuracies: optional {model_name: val_accuracy} for
+                models whose accuracy is cheaper to reuse from training than
+                to recompute here — e.g. pass the CNN's own best validation
+                accuracy from ModelTrainer.fit()'s returned history
+                (history['best_val_acc']) instead of re-running inference
+                over the whole validation set just to score it here. Entries
+                here take priority over recomputing from val_X_images/val_X_features.
         """
         logger.info("Updating model weights based on validation performance")
+        precomputed_accuracies = precomputed_accuracies or {}
 
         individual_accuracies = {}
 
         for name, model in self.models.items():
+            if name in precomputed_accuracies:
+                individual_accuracies[name] = precomputed_accuracies[name]
+                logger.info(f"Model {name} validation accuracy (precomputed): {precomputed_accuracies[name]:.4f}")
+                continue
             model_input = val_X_images if name in IMAGE_INPUT_MODELS else val_X_features
             try:
                 if model_input is not None and hasattr(model, 'predict'):
@@ -275,12 +291,23 @@ class WeightedEnsembleClassifier(BaseEstimator, ClassifierMixin):
                 model_path = filepath.replace('.pkl', f'_{name}_model.pkl')
                 model.save_model(model_path)
 
-    def load_ensemble(self, filepath: str):
+    def load_ensemble(self, filepath: str, cnn_adapter=None):
         """
         Load the ensemble configuration from disk.
 
         Args:
             filepath: Path to the saved ensemble
+            cnn_adapter: BUG FIX — the efficientnetb0 model was never
+                persisted here (it has no save_model/load_model of its own;
+                it's a wrapped torch model, see EffNetSklearnAdapter) and
+                previously this method didn't restore it at all, so any
+                ensemble that went through a save→load round trip silently
+                lost the CNN even though self.weights still carried a
+                (now-orphaned) 'efficientnetb0' weight entry from the pickle.
+                Pass the already-constructed adapter here (build it the same
+                way predict.py's load_models() does: EffNetSklearnAdapter
+                wrapping your loaded EfficientNetB0Classifier) and it will be
+                re-added to self.models under 'efficientnetb0'.
         """
         from src.models.svm_classifier import SVMClassifier
         from src.models.random_forest_classifier import RandomForestClassifier
@@ -310,6 +337,17 @@ class WeightedEnsembleClassifier(BaseEstimator, ClassifierMixin):
                 model.load_model(model_path)
                 self.models[name] = model
                 logger.info(f"Loaded {name} model from {model_path}")
+
+        if cnn_adapter is not None:
+            self.models['efficientnetb0'] = cnn_adapter
+            logger.info("Re-attached efficientnetb0 adapter to loaded ensemble")
+        elif 'efficientnetb0' in self.weights:
+            logger.warning(
+                "Loaded ensemble has an 'efficientnetb0' weight entry but no "
+                "cnn_adapter was passed to load_ensemble() — the CNN will be "
+                "skipped in predict_proba()/predict() until you add it back "
+                "with add_model('efficientnetb0', your_adapter)."
+            )
 
         logger.info(f"Ensemble configuration loaded from {filepath}")
 

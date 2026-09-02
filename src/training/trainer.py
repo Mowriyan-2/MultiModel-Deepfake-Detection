@@ -162,6 +162,14 @@ class ModelTrainer:
         self.train_accs = []
         self.val_accs = []
 
+        # BUG FIX: previously there was no notion of a "best" checkpoint at
+        # all — only periodic epoch_N snapshots (every 10 epochs) were saved,
+        # and if early stopping never triggered, fit() returned whatever the
+        # very last epoch left behind, even if an earlier epoch scored better.
+        self.best_val_acc = -1.0
+        self.best_val_loss = None
+        self.best_state_dict = None
+
         logger.info(f"ModelTrainer initialized on {self.device}")
 
     def _load_config(self, config_path: str):
@@ -243,12 +251,7 @@ class ModelTrainer:
 
             # Calculate accuracy
             with torch.no_grad():
-                if output.dim() == 0 or output.shape[0] == 1:
-                    # Single prediction
-                    pred = torch.sigmoid(output) >= 0.5
-                else:
-                    # Batch predictions
-                    pred = torch.sigmoid(output) >= 0.5
+                pred = torch.sigmoid(output) >= 0.5
                 correct_predictions += pred.eq(target.float()).sum().item()
                 total_samples += data.size(0)
 
@@ -309,7 +312,10 @@ class ModelTrainer:
             save_dir: Directory to save checkpoints (optional)
 
         Returns:
-            Dictionary containing training history
+            Dictionary containing training history. 'best_val_acc' is the
+            best validation accuracy seen across all epochs this call — reuse
+            this instead of re-running inference elsewhere (e.g. for ensemble
+            weighting) when you need this model's validation performance.
         """
         if epochs is None:
             epochs = self.config['training']['epochs']
@@ -334,6 +340,21 @@ class ModelTrainer:
                 self.val_losses.append(val_loss)
                 self.val_accs.append(val_acc)
 
+                # BUG FIX: track + persist the best-val-accuracy checkpoint.
+                # Previously only periodic epoch_N snapshots existed and the
+                # function always returned whatever the last epoch left
+                # behind, which can be worse than an earlier epoch (this is
+                # exactly what happened in the run that prompted this fix:
+                # epoch 13 scored higher than epoch 15).
+                if val_acc > self.best_val_acc:
+                    self.best_val_acc = val_acc
+                    self.best_val_loss = val_loss
+                    self.best_state_dict = {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()}
+                    if save_dir is not None:
+                        best_path = os.path.join(save_dir, "best_model.pth")
+                        torch.save(self.best_state_dict, best_path)
+                        logger.info(f"New best model (Val Acc: {val_acc:.4f}) saved to {best_path}")
+
                 # Check early stopping
                 if self.early_stopping(val_loss, self.model):
                     logger.info(f"Early stopping at epoch {epoch+1}")
@@ -351,7 +372,8 @@ class ModelTrainer:
                     f"Time: {epoch_time:.2f}s"
                 )
 
-                # Save checkpoint
+                # Save periodic checkpoint (separate from the best-model
+                # tracking above — this is just a resumability snapshot)
                 if save_dir is not None and (epoch + 1) % 10 == 0:
                     checkpoint_path = os.path.join(save_dir, f"checkpoint_epoch_{epoch+1}.pth")
                     torch.save({
@@ -376,6 +398,15 @@ class ModelTrainer:
         total_time = time.time() - start_time
         logger.info(f"Training completed in {total_time:.2f} seconds")
 
+        # BUG FIX: restore the best-val-accuracy weights before returning,
+        # regardless of whether early stopping triggered. EarlyStopping's own
+        # restore_best_weights only fires on the early-stop path (and is
+        # keyed off val_loss, which need not agree with val_acc); this makes
+        # sure fit() always hands back its best model by validation accuracy.
+        if self.best_state_dict is not None:
+            self.model.load_state_dict(self.best_state_dict)
+            logger.info(f"Restored best model weights (Val Acc: {self.best_val_acc:.4f})")
+
         # Return training history
         history = {
             'train_losses': self.train_losses,
@@ -383,7 +414,9 @@ class ModelTrainer:
             'val_losses': self.val_losses if val_loader is not None else [],
             'val_accs': self.val_accs if val_loader is not None else [],
             'total_time': total_time,
-            'epochs_trained': len(self.train_losses)
+            'epochs_trained': len(self.train_losses),
+            'best_val_acc': self.best_val_acc if val_loader is not None else None,
+            'best_val_loss': self.best_val_loss if val_loader is not None else None,
         }
 
         return history

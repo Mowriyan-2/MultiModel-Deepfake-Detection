@@ -48,7 +48,12 @@ class GradCAM:
         # Find the target layer
         target_module = dict(self.model.named_modules())[self.target_layer]
         target_module.register_forward_hook(forward_hook)
-        target_module.register_backward_hook(backward_hook)
+        # BUG FIX: register_backward_hook is deprecated, and PyTorch's own
+        # docs note it has real correctness issues for some autograd graph
+        # shapes (grad_input/grad_output aren't always what you'd expect).
+        # register_full_backward_hook is the recommended replacement, with
+        # the same grad_output[0] semantics used above.
+        target_module.register_full_backward_hook(backward_hook)
 
     def generate_cam(self, input_tensor: torch.Tensor, class_idx: int = None) -> np.ndarray:
         """

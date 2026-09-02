@@ -122,8 +122,8 @@ class CrossValidator:
 
             # Create data loaders
             batch_size = self.training_config.get('batch_size', 32)
-            train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
-            val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+            train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
+            val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
 
             # Initialize model
             model = EfficientNetB0Classifier(

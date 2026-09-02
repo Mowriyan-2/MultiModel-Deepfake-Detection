@@ -26,7 +26,6 @@ from src.models.random_forest_classifier import RandomForestClassifier
 from src.models.knn_classifier import KNNClassifier
 from src.models.ensemble_voting import WeightedEnsembleClassifier
 from src.training.trainer import ModelTrainer
-from src.training.cross_validation import CrossValidator
 from src.inference.batch_inference import BatchInferenceEngine
 from src.inference.confidence_calibration import ConfidenceCalibrator
 from src.utils import (setup_logging, get_device, set_seed, create_directories,
@@ -35,22 +34,15 @@ from src.utils import (setup_logging, get_device, set_seed, create_directories,
 
 DEFAULT_CONFIG_PATH = str(Path(__file__).resolve().parent / "configs" / "model_config.yaml")
 
+
 def setup_environment(args):
     """Setup logging, device, seeds, and directories."""
-    # Setup logging
     log_level = "DEBUG" if args.verbose else "INFO"
     setup_logging(log_level=log_level, log_file=args.log_file)
-
-    # Log system information
     log_system_info()
-
-    # Set random seeds
     set_seed(args.seed)
-
-    # Get device
     device = get_device()
 
-    # Create necessary directories
     directories = [
         args.data_dir,
         args.model_dir,
@@ -65,45 +57,34 @@ def setup_environment(args):
         os.path.join(args.output_dir, 'results')
     ]
     create_directories(directories)
-
     return device
+
 
 def load_configurations(args):
     """Load model and training configurations."""
-    # Load model config
     model_config_path = args.model_config or DEFAULT_CONFIG_PATH
     model_config = load_config(model_config_path)
 
-    # Load training config if provided
     training_config = {}
     if args.training_config:
         training_config = load_config(args.training_config)
-        # Merge with model config
-        model_config.update(training_config)
+    model_config.update(training_config)
 
     return model_config
 
+
 def resolved_model_config_path(args):
-    """
-    FIX: several call sites used to pass args.model_config directly to model
-    constructors. Since args.model_config defaults to None unless the user
-    explicitly passes --model_config, every one of those constructors was
-    silently falling back to ITS OWN hardcoded defaults instead of reading
-    configs/model_config.yaml - even though load_configurations() elsewhere
-    already knows how to resolve this correctly. Use this helper everywhere
-    a config PATH (not the loaded dict) needs to be passed to a constructor.
-    """
+    """Resolve the config PATH (not the loaded dict) for constructors that need it."""
     return args.model_config or DEFAULT_CONFIG_PATH
+
 
 def prepare_data(args, device):
     """Prepare datasets for training."""
     logger = logging.getLogger(__name__)
     logger.info("Preparing datasets...")
 
-    # Initialize data processor
     data_processor = DeepfakeDatasetProcessor(resolved_model_config_path(args))
 
-    # Load dataset based on argument
     if args.dataset == 'faceforensics':
         logger.info(f"Loading FaceForensics++ dataset with compression {args.compression}")
         df = data_processor.load_faceforensics_data(args.data_path, args.compression)
@@ -114,13 +95,14 @@ def prepare_data(args, device):
         raise ValueError(f"Unsupported dataset: {args.dataset}")
 
     logger.info(f"Dataset loaded: {len(df)} samples "
-               f"({len(df[df.label==0])} real, {len(df[df.label==1])} fake)")
+                f"({len(df[df.label==0])} real, {len(df[df.label==1])} fake)")
 
-    # Create stratified splits
-    logger.info(f"Creating {args.n_folds}-fold stratified splits")
+    # BUG FIX: splits are now video-grouped (see DeepfakeDatasetProcessor.
+    # create_stratified_splits) instead of frame-level, so frames from one
+    # video can no longer land in both the train and validation side of a fold.
+    logger.info(f"Creating {args.n_folds}-fold video-grouped stratified splits")
     splits = data_processor.create_stratified_splits(df, args.n_folds, args.seed)
 
-    # Save splits if requested
     if args.save_splits:
         splits_dir = os.path.join(args.output_dir, 'splits')
         data_processor.save_splits(splits, df, splits_dir)
@@ -128,171 +110,154 @@ def prepare_data(args, device):
 
     return df, splits, data_processor
 
-def train_individual_models(args, device, df, splits, data_processor, model_config):
-    """Train individual models (EfficientNetB0, SVM, RF, KNN)."""
-    logger = logging.getLogger(__name__)
-    logger.info("Training individual models...")
 
-    # Import dataset class
+def train_one_fold(args, device, df, splits, fold, model_config):
+    """
+    Train EfficientNetB0 + SVM + RF + KNN for a single fold, using freshly
+    constructed models.
+
+    BUG FIX: previously all four models were constructed once outside the
+    fold loop and reused/retrained across every fold without ever being
+    reset. Since standard k-fold means fold i's held-out validation samples
+    are part of every OTHER fold's training set, reusing the same model
+    object meant that by fold 5 the model had already been trained (via
+    backprop) on fold 5's own "held out" samples during folds 1-4 — silently
+    inflating every fold's reported validation accuracy after the first.
+    Constructing fresh models here, once per fold, closes that leak.
+    """
+    logger = logging.getLogger(__name__)
     from src.data_preprocessing import DeepfakeDataset
     from torch.utils.data import DataLoader
+    from src.feature_extraction import extract_features
 
-    # Initialize models
-    # FIX: load_config() nests these under model_config['model']['efficientnetb0'],
-    # not model_config['efficientnetb0'] - the old lookup always returned {}
-    # and silently used the hardcoded defaults regardless of the YAML.
+    train_idx, val_idx = splits[fold]
+    train_df = df.iloc[train_idx].reset_index(drop=True)
+    val_df = df.iloc[val_idx].reset_index(drop=True)
+
+    train_dataset = DeepfakeDataset(train_df, transform=None)
+    val_dataset = DeepfakeDataset(val_df, transform=None)
+
+    batch_size = model_config.get('training', {}).get('batch_size', 32)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+
+    # Fresh models every fold.
     effnet_cfg = model_config.get('model', {}).get('efficientnetb0', {})
     efficientnet_model = EfficientNetB0Classifier(
         pretrained=effnet_cfg.get('pretrained', True),
         num_classes=effnet_cfg.get('num_classes', 1),
         dropout_rate=effnet_cfg.get('dropout_rate', 0.3)
     ).to(device)
-
     svm_model = SVMClassifier(resolved_model_config_path(args))
     rf_model = RandomForestClassifier(resolved_model_config_path(args))
     knn_model = KNNClassifier(resolved_model_config_path(args))
 
-    # Store training histories
-    histories = {}
+    effnet_trainer = ModelTrainer(efficientnet_model, device=device, config_path=resolved_model_config_path(args))
 
-    # Train each fold
-    for fold, (train_idx, val_idx) in enumerate(splits):
-        if args.fold is not None and fold != args.fold:
-            continue  # Skip if specific fold requested
+    logger.info("Training EfficientNetB0...")
+    start_time = time.time()
+    save_dir = os.path.join(args.model_dir, f'efficientnetb0/fold_{fold+1}') if args.save_models else None
+    effnet_history = effnet_trainer.fit(
+        train_loader, val_loader,
+        epochs=model_config.get('training', {}).get('epochs', 50),
+        save_dir=save_dir
+    )
+    effnet_time = time.time() - start_time
+    logger.info(f"EfficientNetB0 training completed in {format_time(effnet_time)}")
 
-        logger.info(f"=== Training Fold {fold+1}/{args.n_folds} ===")
+    # SVM/RF/KNN need the pooled 1280-dim EfficientNetB0 features, not the
+    # classifier's logits — build a feature extractor sharing the
+    # just-trained (and now best-checkpoint-restored) backbone weights.
+    feature_extractor = EfficientNetB0FeatureExtractor(pretrained=False)
+    feature_extractor.backbone.load_state_dict(efficientnet_model.backbone.state_dict())
+    feature_extractor.to(device).eval()
 
-        try:
-            # Split data
-            train_df = df.iloc[train_idx].reset_index(drop=True)
-            val_df = df.iloc[val_idx].reset_index(drop=True)
+    logger.info("Extracting features for traditional ML models...")
+    train_features, train_labels = extract_features(feature_extractor, train_loader, device)
+    val_features, val_labels = extract_features(feature_extractor, val_loader, device)
 
-            # Create datasets
-            train_dataset = DeepfakeDataset(train_df, transform=None)
-            val_dataset = DeepfakeDataset(val_df, transform=None)
+    logger.info("Training SVM...")
+    start_time = time.time()
+    svm_model.fit(train_features, train_labels)
+    logger.info(f"SVM training completed in {format_time(time.time() - start_time)}")
 
-            # Create data loaders
-            batch_size = model_config.get('training', {}).get('batch_size', 32)
-            train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
-            val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+    logger.info("Training Random Forest...")
+    start_time = time.time()
+    rf_model.fit(train_features, train_labels)
+    logger.info(f"Random Forest training completed in {format_time(time.time() - start_time)}")
 
-            # Initialize trainers
-            effnet_trainer = ModelTrainer(efficientnet_model, device=device, config_path=resolved_model_config_path(args))
-            # For traditional ML models, we'll extract features first
+    logger.info("Training KNN...")
+    start_time = time.time()
+    knn_model.fit(train_features, train_labels)
+    logger.info(f"KNN training completed in {format_time(time.time() - start_time)}")
 
-            # Train EfficientNetB0
-            logger.info("Training EfficientNetB0...")
-            start_time = time.time()
-            effnet_history = effnet_trainer.fit(train_loader, val_loader,
-                                              epochs=model_config.get('training', {}).get('epochs', 50),
-                                              save_dir=os.path.join(args.model_dir, f'efficientnetb0/fold_{fold+1}') if args.save_models else None)
-            effnet_time = time.time() - start_time
-            logger.info(f"EfficientNetB0 training completed in {format_time(effnet_time)}")
+    if args.save_models:
+        svm_model.save_model(os.path.join(args.model_dir, f'svm/fold_{fold+1}', 'svm_model.pkl'))
+        rf_model.save_model(os.path.join(args.model_dir, f'random_forest/fold_{fold+1}', 'rf_model.pkl'))
+        knn_model.save_model(os.path.join(args.model_dir, f'knn/fold_{fold+1}', 'knn_model.pkl'))
+    # BUG FIX: the old code repeated this exact save block a second time,
+    # unconditionally, right after the fold's try/except — ignoring the
+    # `if args.save_models:` guard entirely and silently saving to disk even
+    # when --save_models wasn't passed. It also duplicated the "Fold N
+    # completed" log line, which is why earlier runs showed it twice per
+    # fold. That duplicate block has been removed; this is the only save.
 
-            # Extract features for traditional ML models
-            logger.info("Extracting features for traditional ML models...")
-            from src.feature_extraction import extract_features
+    logger.info(f"Fold {fold+1} completed")
 
-            # SVM/RF/KNN need the pooled 1280-dim EfficientNetB0 features, not the
-            # classifier's logits — build a feature extractor that shares the
-            # just-trained backbone weights rather than feeding it the classifier.
-            feature_extractor = EfficientNetB0FeatureExtractor(pretrained=False)
-            feature_extractor.backbone.load_state_dict(efficientnet_model.backbone.state_dict())
-            feature_extractor.to(device).eval()
+    return {
+        'efficientnet_model': efficientnet_model,
+        'feature_extractor': feature_extractor,
+        'svm_model': svm_model,
+        'rf_model': rf_model,
+        'knn_model': knn_model,
+        'effnet_history': effnet_history,
+        # ModelTrainer.fit() already computes this — reuse it for ensemble
+        # weighting instead of re-running inference over raw images just to
+        # score the CNN again (see create_ensemble_for_fold below).
+        'efficientnet_val_accuracy': effnet_history.get('best_val_acc'),
+    }
 
-            # Get features for training
-            train_features, train_labels = extract_features(feature_extractor, train_loader, device)
-            val_features, val_labels = extract_features(feature_extractor, val_loader, device)
 
-            # Train SVM
-            logger.info("Training SVM...")
-            start_time = time.time()
-            svm_model.fit(train_features, train_labels)
-            svm_time = time.time() - start_time
-            logger.info(f"SVM training completed in {format_time(svm_time)}")
+def create_ensemble_for_fold(args, device, fold_models, df, splits, fold):
+    """
+    Build and weight the ensemble for one fold.
 
-            # Train Random Forest
-            logger.info("Training Random Forest...")
-            start_time = time.time()
-            rf_model.fit(train_features, train_labels)
-            rf_time = time.time() - start_time
-            logger.info(f"Random Forest training completed in {format_time(rf_time)}")
+    BUG FIX (wrong split): previously this always used splits[0] regardless
+    of which fold's models were passed in, so every fold except fold 0 was
+    weighted against the wrong validation set. Now takes the fold index
+    explicitly and uses splits[fold].
 
-            # Train KNN
-            logger.info("Training KNN...")
-            start_time = time.time()
-            knn_model.fit(train_features, train_labels)
-            knn_time = time.time() - start_time
-            logger.info(f"KNN training completed in {format_time(knn_time)}")
-
-            # Store histories
-            histories[f'fold_{fold+1}'] = {
-                'efficientnetb0': effnet_history,
-                'svm_time': svm_time,
-                'rf_time': rf_time,
-                'knn_time': knn_time,
-                'effnet_time': effnet_time
-            }
-
-            # Save models if requested
-            if args.save_models:
-                # Save EfficientNetB0
-                effnet_path = os.path.join(args.model_dir, f'efficientnetb0/fold_{fold+1}', 'model_best.pth')
-                if os.path.exists(effnet_path):
-                    # Already saved by trainer
-                    pass
-
-                # Save traditional ML models
-                svm_model.save_model(os.path.join(args.model_dir, f'svm/fold_{fold+1}', 'svm_model.pkl'))
-                rf_model.save_model(os.path.join(args.model_dir, f'random_forest/fold_{fold+1}', 'rf_model.pkl'))
-                knn_model.save_model(os.path.join(args.model_dir, f'knn/fold_{fold+1}', 'knn_model.pkl'))
-
-            logger.info(f"Fold {fold+1} completed")
-
-        except Exception as e:
-            # FIX: previously an exception anywhere in a fold (e.g. the missing-
-            # directory save bug) propagated straight out of this loop and killed
-            # the entire cross-validation run, throwing away every already-
-            # completed fold. Now one bad fold is logged and skipped so the
-            # remaining folds still run and whatever did succeed still counts.
-            logger.error(f"Fold {fold+1} failed: {e}", exc_info=True)
-            continue
-
-            # Save traditional ML models
-            svm_model.save_model(os.path.join(args.model_dir, f'svm/fold_{fold+1}', 'svm_model.pkl'))
-            rf_model.save_model(os.path.join(args.model_dir, f'random_forest/fold_{fold+1}', 'rf_model.pkl'))
-            knn_model.save_model(os.path.join(args.model_dir, f'knn/fold_{fold+1}', 'knn_model.pkl'))
-
-        logger.info(f"Fold {fold+1} completed")
-
-    return efficientnet_model, feature_extractor, svm_model, rf_model, knn_model, histories
-
-def create_ensemble(args, device, efficientnet_model, feature_extractor, svm_model, rf_model, knn_model, df, splits, data_processor):
-    """Create and train weighted ensemble."""
+    BUG FIX (CNN gets zero weight): previously update_weights() was only
+    ever given val_X_features, so the CNN (which needs raw images, not
+    features) always hit the "no input; skipping" path and got weight 0 —
+    meaning the most expensive model to train contributed nothing to the
+    final ensemble. Now its own best validation accuracy (already computed
+    during training) is passed in directly via precomputed_accuracies,
+    without needing to re-run inference over a large batch of raw images.
+    """
     logger = logging.getLogger(__name__)
-    logger.info("Creating weighted ensemble...")
+    logger.info(f"Creating weighted ensemble for fold {fold+1}...")
 
-    # Initialize ensemble
+    efficientnet_model = fold_models['efficientnet_model']
+    feature_extractor = fold_models['feature_extractor']
+    svm_model = fold_models['svm_model']
+    rf_model = fold_models['rf_model']
+    knn_model = fold_models['knn_model']
+    efficientnet_val_accuracy = fold_models['efficientnet_val_accuracy']
+
     ensemble = WeightedEnsembleClassifier(resolved_model_config_path(args))
 
-    # The raw EfficientNetB0Classifier has no predict_proba/sklearn-style
-    # interface, and it expects raw images rather than the 1280-dim features
-    # SVM/RF/KNN use — wrap it in the adapter before adding it to the ensemble.
     cnn_adapter = EffNetSklearnAdapter(efficientnet_model, device)
-
-    # Add models
     ensemble.add_model('efficientnetb0', cnn_adapter)
     ensemble.add_model('svm', svm_model)
     ensemble.add_model('random_forest', rf_model)
     ensemble.add_model('knn', knn_model)
 
-    # Create a combined dataset for ensemble weight optimization
     from src.data_preprocessing import DeepfakeDataset
     from torch.utils.data import DataLoader
     from src.feature_extraction import extract_features
 
-    # Use first fold for weight optimization (or combine all folds)
-    train_idx, val_idx = splits[0]  # Use first fold
+    train_idx, val_idx = splits[fold]
     train_df = df.iloc[train_idx].reset_index(drop=True)
     val_df = df.iloc[val_idx].reset_index(drop=True)
 
@@ -303,110 +268,56 @@ def create_ensemble(args, device, efficientnet_model, feature_extractor, svm_mod
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
 
-    # Extract features (for SVM/RF/KNN) using the feature extractor, not the classifier
     logger.info("Extracting features for ensemble training...")
     train_features, train_labels = extract_features(feature_extractor, train_loader, device)
     val_features, val_labels = extract_features(feature_extractor, val_loader, device)
 
-    # Fit ensemble (this sets up the structure)
     ensemble.fit(train_features, train_labels)
 
-    # Update weights based on validation performance
     logger.info("Optimizing ensemble weights...")
-    ensemble.update_weights(val_X_features=val_features, val_y=val_labels)
+    ensemble.update_weights(
+        val_X_features=val_features, val_y=val_labels,
+        precomputed_accuracies=(
+            {'efficientnetb0': efficientnet_val_accuracy}
+            if efficientnet_val_accuracy is not None else None
+        )
+    )
 
-    logger.info(f"Final ensemble weights: {ensemble.weights}")
+    logger.info(f"Final ensemble weights for fold {fold+1}: {ensemble.weights}")
 
-    # Save ensemble
     if args.save_models:
-        ensemble_dir = os.path.join(args.model_dir, 'ensemble')
+        ensemble_dir = os.path.join(args.model_dir, 'ensemble', f'fold_{fold+1}')
         os.makedirs(ensemble_dir, exist_ok=True)
         ensemble.save_ensemble(os.path.join(ensemble_dir, 'ensemble_model.pkl'))
         logger.info(f"Ensemble saved to {ensemble_dir}")
 
-    return ensemble
+    return ensemble, val_features, val_labels
 
-def evaluate_model(args, device, ensemble, feature_extractor, df, splits, data_processor):
-    """Evaluate the ensemble model."""
+
+def evaluate_fold(ensemble, val_features, val_labels, fold):
+    """Evaluate one fold's ensemble on its own (correctly-matched) validation split."""
     logger = logging.getLogger(__name__)
-    logger.info("Evaluating ensemble model...")
-
-    from src.data_preprocessing import DeepfakeDataset
-    from torch.utils.data import DataLoader
-    from src.feature_extraction import extract_features
     from src.utils import calculate_metrics
-    import numpy as np
 
-    # Use all folds for evaluation, or specific fold if requested
-    folds_to_evaluate = [args.fold] if args.fold is not None else range(len(splits))
+    logger.info(f"Evaluating Fold {fold+1}...")
+    val_predictions = ensemble.predict(X_features=val_features)
+    val_probabilities = ensemble.predict_proba(X_features=val_features)
 
-    fold_results = []
+    metrics = calculate_metrics(val_labels, val_predictions, val_probabilities)
+    metrics['fold'] = fold + 1
 
-    for fold in folds_to_evaluate:
-        logger.info(f"Evaluating Fold {fold+1}/{len(splits)}")
-        train_idx, val_idx = splits[fold]
-        # For evaluation, we use the validation set
-        val_df = df.iloc[val_idx].reset_index(drop=True)
+    logger.info(f"Fold {fold+1} Results:")
+    for metric_name, value in metrics.items():
+        if metric_name != 'fold':
+            logger.info(f"  {metric_name}: {value:.4f}")
 
-        val_dataset = DeepfakeDataset(val_df, transform=None)
-        val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=4)
+    return metrics
 
-        # Extract features using the same feature extractor (trained backbone)
-        # that was used for training — not a freshly re-initialized model,
-        # which would silently evaluate against untrained ImageNet features.
-        # Note: evaluation here only exercises the SVM/RF/KNN path (X_features);
-        # the CNN adapter is skipped with a logged warning since no raw image
-        # batch is supplied — extend this call with X_images= to include it.
-        val_features, val_labels = extract_features(feature_extractor, val_loader, device)
-
-        # Make predictions
-        logger.info("Making predictions...")
-        val_predictions = ensemble.predict(X_features=val_features)
-        val_probabilities = ensemble.predict_proba(X_features=val_features)
-
-        # Calculate metrics
-        metrics = calculate_metrics(val_labels, val_predictions, val_probabilities)
-        metrics['fold'] = fold + 1
-
-        fold_results.append(metrics)
-
-        logger.info(f"Fold {fold+1} Results:")
-        for metric_name, value in metrics.items():
-            if metric_name != 'fold':
-                logger.info(f"  {metric_name}: {value:.4f}")
-
-    # Calculate average results
-    if len(fold_results) > 1:
-        avg_metrics = {}
-        for key in fold_results[0].keys():
-            if key != 'fold':
-                values = [result[key] for result in fold_results]
-                avg_metrics[key] = np.mean(values)
-                avg_metrics[f'{key}_std'] = np.std(values)
-
-        logger.info("Average Results Across Folds:")
-        for metric_name, value in avg_metrics.items():
-            if not metric_name.endswith('_std'):
-                std_value = avg_metrics.get(f'{metric_name}_std', 0)
-                logger.info(f"  {metric_name}: {value:.4f} ± {std_value:.4f}")
-
-        # Save results
-        results_path = os.path.join(args.output_dir, 'results', 'evaluation_results.json')
-        import json
-        with open(results_path, 'w') as f:
-            json.dump({
-                'fold_results': fold_results,
-                'average_results': avg_metrics
-            }, f, indent=2)
-        logger.info(f"Evaluation results saved to {results_path}")
-
-    return fold_results
 
 def main():
     """Main training function."""
     parser = argparse.ArgumentParser(description='Train Multi-model Deepfake Detection System')
 
-    # Data arguments
     parser.add_argument('--dataset', type=str, required=True,
                        choices=['faceforensics', 'celebdf'],
                        help='Dataset to train on')
@@ -418,7 +329,6 @@ def main():
     parser.add_argument('--data_dir', type=str, default='./data',
                        help='Directory for data storage (default: ./data)')
 
-    # Model arguments
     parser.add_argument('--model_dir', type=str, default='./models',
                        help='Directory to save models (default: ./models)')
     parser.add_argument('--model_config', type=str,
@@ -427,7 +337,6 @@ def main():
     parser.add_argument('--training_config', type=str,
                        help='Path to training configuration YAML file (optional)')
 
-    # Training arguments
     parser.add_argument('--n_folds', type=int, default=5,
                        help='Number of folds for cross-validation (default: 5)')
     parser.add_argument('--fold', type=int,
@@ -445,7 +354,6 @@ def main():
     parser.add_argument('--save_splits', action='store_true',
                        help='Save train/validation splits to disk')
 
-    # Output arguments
     parser.add_argument('--output_dir', type=str, default='./output',
                        help='Directory for output files (default: ./output)')
     parser.add_argument('--log_file', type=str,
@@ -453,22 +361,12 @@ def main():
     parser.add_argument('--verbose', action='store_true',
                        help='Enable verbose logging')
 
-    # Evaluation arguments
-    parser.add_argument('--evaluate_only', action='store_true',
-                       help='Only evaluate existing models, do not train')
-    parser.add_argument('--resume_from', type=str,
-                       help='Path to checkpoint to resume training from')
-
     args = parser.parse_args()
 
     try:
-        # Setup environment
         device = setup_environment(args)
-
-        # Load configurations
         model_config = load_configurations(args)
 
-        # Override config with command line arguments
         if 'training' not in model_config:
             model_config['training'] = {}
         model_config['training']['epochs'] = args.epochs
@@ -476,9 +374,9 @@ def main():
         model_config['training']['learning_rate'] = args.learning_rate
 
         logger = logging.getLogger(__name__)
-        logger.info("="*60)
+        logger.info("=" * 60)
         logger.info("Multi-model Deepfake Detection Training Started")
-        logger.info("="*60)
+        logger.info("=" * 60)
         logger.info(f"Dataset: {args.dataset}")
         logger.info(f"Data path: {args.data_path}")
         if args.dataset == 'faceforensics':
@@ -491,38 +389,63 @@ def main():
         logger.info(f"Learning rate: {args.learning_rate}")
         logger.info(f"Seed: {args.seed}")
         logger.info(f"Device: {device}")
-        logger.info("="*60)
+        logger.info("=" * 60)
 
         start_time = time.time()
 
-        if args.evaluate_only:
-            logger.info("Evaluation mode: Loading existing models...")
-            # TODO: Implement model loading and evaluation
-            logger.warning("Evaluation-only mode not fully implemented yet")
+        df, splits, data_processor = prepare_data(args, device)
+
+        folds_to_run = [args.fold] if args.fold is not None else range(len(splits))
+        fold_results = []
+
+        for fold in folds_to_run:
+            logger.info(f"=== Fold {fold+1}/{args.n_folds} ===")
+            try:
+                fold_models = train_one_fold(args, device, df, splits, fold, model_config)
+                ensemble, val_features, val_labels = create_ensemble_for_fold(
+                    args, device, fold_models, df, splits, fold
+                )
+                metrics = evaluate_fold(ensemble, val_features, val_labels, fold)
+                fold_results.append(metrics)
+            except Exception as e:
+                logger.error(f"Fold {fold+1} failed: {e}", exc_info=True)
+                continue
+
+        # Aggregate across folds
+        if fold_results:
+            avg_metrics = {}
+            for key in fold_results[0].keys():
+                if key != 'fold':
+                    values = [result[key] for result in fold_results]
+                    avg_metrics[key] = float(np.mean(values))
+                    avg_metrics[f'{key}_std'] = float(np.std(values))
+
+            logger.info("Average Results Across Folds:")
+            for metric_name, value in avg_metrics.items():
+                if not metric_name.endswith('_std'):
+                    std_value = avg_metrics.get(f'{metric_name}_std', 0)
+                    logger.info(f"  {metric_name}: {value:.4f} \u00b1 {std_value:.4f}")
+
+            results_path = os.path.join(args.output_dir, 'results', 'evaluation_results.json')
+            import json
+            with open(results_path, 'w') as f:
+                json.dump({
+                    'fold_results': fold_results,
+                    'average_results': avg_metrics
+                }, f, indent=2)
+            logger.info(f"Evaluation results saved to {results_path}")
         else:
-            # Prepare data
-            df, splits, data_processor = prepare_data(args, device)
-
-            # Train individual models
-            efficientnet_model, feature_extractor, svm_model, rf_model, knn_model, histories = train_individual_models(
-                args, device, df, splits, data_processor, model_config)
-
-            # Create ensemble
-            ensemble = create_ensemble(
-                args, device, efficientnet_model, feature_extractor, svm_model, rf_model, knn_model,
-                df, splits, data_processor)
-
-            # Evaluate ensemble
-            evaluate_model(args, device, ensemble, feature_extractor, df, splits, data_processor)
+            logger.warning("No folds completed successfully — no results to report.")
 
         total_time = time.time() - start_time
-        logger.info("="*60)
+        logger.info("=" * 60)
         logger.info(f"Training completed successfully in {format_time(total_time)}")
-        logger.info("="*60)
+        logger.info("=" * 60)
 
     except Exception as e:
         logger.error(f"Training failed with error: {e}", exc_info=True)
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()

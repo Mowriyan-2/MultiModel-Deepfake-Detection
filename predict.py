@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Prediction script for Multi-model-deep-fake-detection.
-Handles loading trained models and making predictions on new data.
+Loads trained models and runs inference on new images.
 """
 import argparse
 import os
@@ -34,95 +34,88 @@ from src.utils import (setup_logging, get_device, set_seed, create_directories,
 
 DEFAULT_CONFIG_PATH = str(Path(__file__).resolve().parent / "configs" / "model_config.yaml")
 
-def setup_environment(args):
-    """Setup logging, device, seeds, and directories."""
-    # Setup logging
-    log_level = "DEBUG" if args.verbose else "INFO"
-    setup_logging(log_level=log_level, log_file=args.log_file)
-
-    # Get device
-    device = get_device()
-
-    return device
 
 def load_models(args, device):
-    """Load trained models from disk."""
-    logger = logging.getLogger(__name__)
-    logger.info("Loading trained models...")
+    """
+    Load trained models for inference.
 
-    # Initialize individual models
+    BUG FIX (path layout mismatch): train.py saves models nested by fold —
+    model_dir/svm/fold_N/svm_model.pkl, model_dir/efficientnetb0/fold_N/best_model.pth,
+    model_dir/ensemble/fold_N/ensemble_model.pkl. This function previously
+    looked for flat paths like model_dir/svm/svm_model.pkl and
+    model_dir/efficientnetb0/model_best.pth — a filename that was never even
+    produced by trainer.py (only periodic checkpoint_epoch_N.pth snapshots
+    existed before the best-checkpoint fix). Nothing trained by train.py
+    could ever be loaded through this path. Fixed to use the same
+    fold_{args.fold}/ layout and the best_model.pth filename trainer.py now
+    actually writes.
+    """
+    logger = logging.getLogger(__name__)
+    logger.info(f"Loading models from {args.model_dir} (fold {args.fold})")
+
+    model_dir = args.model_dir
+    fold_tag = f"fold_{args.fold}"
+
+    # Load EfficientNetB0 classifier
     efficientnet_model = EfficientNetB0Classifier(
-        pretrained=False,  # We'll load our trained weights
+        pretrained=False,
         num_classes=1
     ).to(device)
 
-    svm_model = SVMClassifier(args.model_config)
-    rf_model = RandomForestClassifier(args.model_config)
-    knn_model = KNNClassifier(args.model_config)
-
-    # Load models from specified directory
-    model_dir = args.model_dir
-
-    # Load EfficientNetB0
-    effnet_path = os.path.join(model_dir, 'efficientnetb0', 'model_best.pth')
-    if os.path.exists(effnet_path):
-        efficientnet_model.load_state_dict(torch.load(effnet_path, map_location=device))
-        efficientnet_model.eval()
-        logger.info(f"EfficientNetB0 model loaded from {effnet_path}")
+    effnet_dir = os.path.join(model_dir, 'efficientnetb0', fold_tag)
+    best_path = os.path.join(effnet_dir, 'best_model.pth')
+    if os.path.exists(best_path):
+        state_dict = torch.load(best_path, map_location=device)
+        efficientnet_model.load_state_dict(state_dict)
+        logger.info(f"EfficientNetB0 best-checkpoint loaded from {best_path}")
+    elif os.path.isdir(effnet_dir):
+        # Fall back to the most recent periodic checkpoint if no best_model.pth
+        # exists yet (e.g. models trained before the best-checkpoint fix).
+        checkpoints = sorted(
+            [f for f in os.listdir(effnet_dir) if f.startswith('checkpoint_epoch_') and f.endswith('.pth')],
+            key=lambda f: int(f.split('_')[-1].split('.')[0])
+        )
+        if checkpoints:
+            checkpoint_path = os.path.join(effnet_dir, checkpoints[-1])
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            efficientnet_model.load_state_dict(checkpoint['model_state_dict'])
+            logger.info(f"EfficientNetB0 periodic checkpoint loaded from {checkpoint_path} "
+                        f"(no best_model.pth found — this model may not be from the best epoch)")
+        else:
+            logger.warning(f"No EfficientNetB0 checkpoint found in {effnet_dir}, using untrained ImageNet weights")
     else:
-        # Try to find any checkpoint
-        effnet_dir = os.path.join(model_dir, 'efficientnetb0')
-        if os.path.exists(effnet_dir):
-            checkpoints = [f for f in os.listdir(effnet_dir) if f.endswith('.pth')]
-            if checkpoints:
-                latest_checkpoint = sorted(checkpoints)[-1]
-                effnet_path = os.path.join(effnet_dir, latest_checkpoint)
-                efficientnet_model.load_state_dict(torch.load(effnet_path, map_location=device))
-                efficientnet_model.eval()
-                logger.info(f"EfficientNetB0 model loaded from {effnet_path}")
-            else:
-                logger.warning(f"No EfficientNetB0 checkpoints found in {effnet_dir}")
-                logger.info("Using ImageNet pretrained weights")
-        else:
-            logger.warning(f"EfficientNetB0 directory not found: {effnet_dir}")
-            logger.info("Using ImageNet pretrained weights")
+        logger.warning(f"EfficientNetB0 checkpoint directory not found: {effnet_dir}, using untrained ImageNet weights")
 
-    # Load traditional ML models
-    try:
-        svm_path = os.path.join(model_dir, 'svm', 'svm_model.pkl')
-        if os.path.exists(svm_path):
-            svm_model.load_model(svm_path)
-            logger.info(f"SVM model loaded from {svm_path}")
-        else:
-            logger.warning(f"SVM model not found at {svm_path}")
-    except Exception as e:
-        logger.warning(f"Failed to load SVM model: {e}")
+    # Load SVM, Random Forest, KNN — all under their own fold_N subfolder
+    svm_model = SVMClassifier(args.model_config)
+    svm_path = os.path.join(model_dir, 'svm', fold_tag, 'svm_model.pkl')
+    if os.path.exists(svm_path):
+        svm_model.load_model(svm_path)
+        logger.info(f"SVM model loaded from {svm_path}")
+    else:
+        logger.warning(f"SVM model not found at {svm_path}")
 
-    try:
-        rf_path = os.path.join(model_dir, 'random_forest', 'rf_model.pkl')
-        if os.path.exists(rf_path):
-            rf_model.load_model(rf_path)
-            logger.info(f"Random Forest model loaded from {rf_path}")
-        else:
-            logger.warning(f"Random Forest model not found at {rf_path}")
-    except Exception as e:
-        logger.warning(f"Failed to load Random Forest model: {e}")
+    rf_model = RandomForestClassifier(args.model_config)
+    rf_path = os.path.join(model_dir, 'random_forest', fold_tag, 'rf_model.pkl')
+    if os.path.exists(rf_path):
+        rf_model.load_model(rf_path)
+        logger.info(f"Random Forest model loaded from {rf_path}")
+    else:
+        logger.warning(f"Random Forest model not found at {rf_path}")
 
-    try:
-        knn_path = os.path.join(model_dir, 'knn', 'knn_model.pkl')
-        if os.path.exists(knn_path):
-            knn_model.load_model(knn_path)
-            logger.info(f"KNN model loaded from {knn_path}")
-        else:
-            logger.warning(f"KNN model not found at {knn_path}")
-    except Exception as e:
-        logger.warning(f"Failed to load KNN model: {e}")
+    knn_model = KNNClassifier(args.model_config)
+    knn_path = os.path.join(model_dir, 'knn', fold_tag, 'knn_model.pkl')
+    if os.path.exists(knn_path):
+        knn_model.load_model(knn_path)
+        logger.info(f"KNN model loaded from {knn_path}")
+    else:
+        logger.warning(f"KNN model not found at {knn_path}")
 
-    # Create and load ensemble
-    # The raw EfficientNetB0Classifier is a plain nn.Module with no predict_proba,
-    # so wrap it in the sklearn-compatible adapter before adding it to the ensemble.
-    # SVM/RF/KNN were trained on pooled 1280-dim features, so give them their own
-    # feature extractor sharing the classifier's backbone weights.
+    # The raw EfficientNetB0Classifier is a plain nn.Module with no
+    # predict_proba, and it expects raw images rather than the 1280-dim
+    # features SVM/RF/KNN use — wrap it in the adapter before adding it to
+    # the ensemble. Also build a feature extractor sharing its backbone
+    # weights for the SVM/RF/KNN feature-extraction path.
     cnn_adapter = EffNetSklearnAdapter(efficientnet_model, device)
     feature_extractor = EfficientNetB0FeatureExtractor(pretrained=False)
     feature_extractor.backbone.load_state_dict(efficientnet_model.backbone.state_dict())
@@ -134,19 +127,22 @@ def load_models(args, device):
     ensemble.add_model('random_forest', rf_model)
     ensemble.add_model('knn', knn_model)
 
-    ensemble_path = os.path.join(model_dir, 'ensemble', 'ensemble_model.pkl')
+    ensemble_path = os.path.join(model_dir, 'ensemble', fold_tag, 'ensemble_model.pkl')
     if os.path.exists(ensemble_path):
-        ensemble.load_ensemble(ensemble_path)
+        # BUG FIX: load_ensemble() never restored the efficientnetb0 adapter
+        # on its own (it only reconstructs svm/random_forest/knn from their
+        # own pickles) — pass cnn_adapter explicitly so it gets re-attached
+        # instead of silently vanishing from the loaded ensemble.
+        ensemble.load_ensemble(ensemble_path, cnn_adapter=cnn_adapter)
         logger.info(f"Ensemble model loaded from {ensemble_path}")
     else:
-        logger.info("Setting up ensemble with loaded models")
-        # Initialize ensemble (models already added)
-        # Need some dummy data to fit the ensemble structure
+        logger.info("No saved ensemble found — setting up ensemble with just-loaded individual models")
         dummy_features = np.zeros((1, 1280))  # EfficientNetB0 feature size
         dummy_labels = np.array([0])
         ensemble.fit(dummy_features, dummy_labels)
 
     return ensemble, feature_extractor, device
+
 
 def predict_single_image(args, ensemble, feature_extractor, device):
     """Make prediction on a single image."""
@@ -159,11 +155,9 @@ def predict_single_image(args, ensemble, feature_extractor, device):
     import torchvision.transforms as transforms
     from PIL import Image
 
-    # Check if input file exists
     if not os.path.exists(args.input):
         raise FileNotFoundError(f"Input file not found: {args.input}")
 
-    # Create dataset for single image
     import pandas as pd
     df = pd.DataFrame({
         'image_path': [args.input],
@@ -179,60 +173,29 @@ def predict_single_image(args, ensemble, feature_extractor, device):
     image_batch, _ = next(iter(dataloader))
     image_batch = image_batch.to(device)
 
-    # Extract pooled 1280-dim features for the sklearn-style models
     features, _ = extract_features(feature_extractor, dataloader, device)
 
-    # Make prediction — route features to SVM/RF/KNN and the raw image batch to
-    # the CNN adapter (the two require different input shapes, see ensemble_voting.py)
     logger.info("Running ensemble prediction...")
     prediction = ensemble.predict(X_features=features, X_images=image_batch)[0]
     probabilities = ensemble.predict_proba(X_features=features, X_images=image_batch)[0]
 
-    # Get confidence (probability of predicted class)
-    confidence = probabilities[prediction]
+    confidence = float(np.max(probabilities))
+    label = 'FAKE' if prediction == 1 else 'REAL'
 
-    # Format output
-    label_map = {0: "Real", 1: "Fake"}
-    prediction_label = label_map[prediction]
+    logger.info(f"Prediction: {label} (confidence: {confidence:.4f})")
+    logger.info(f"Probabilities: Real={probabilities[0]:.4f}, Fake={probabilities[1]:.4f}")
 
-    logger.info(f"Prediction: {prediction_label}")
-    logger.info(f"Confidence: {confidence:.4f} ({confidence*100:.2f}%)")
-    logger.info(f"Probabilities - Real: {probabilities[0]:.4f}, Fake: {probabilities[1]:.4f}")
-
-    # Save results if requested
-    if args.output:
-        output_dir = os.path.dirname(args.output)
-        if output_dir:
-            os.makedirs(output_dir, exist_ok=True)
-
-        import json
-        results = {
-            'input_image': args.input,
-            'prediction': prediction_label,
-            'confidence': float(confidence),
-            'probability_real': float(probabilities[0]),
-            'probability_fake': float(probabilities[1])
-        }
-
-        with open(args.output, 'w') as f:
-            json.dump(results, f, indent=2)
-        logger.info(f"Results saved to {args.output}")
-
-    # Generate GradCAM visualization if requested
     if args.gradcam:
-        logger.info("Generating GradCAM visualization...")
         try:
-            # Load and preprocess image for GradCAM
-            original_image = Image.open(args.input).convert('RGB')
-            original_image_np = np.array(original_image)
-
-            # Preprocess for model input
             transform = transforms.Compose([
                 transforms.Resize((224, 224)),
                 transforms.ToTensor(),
                 transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
             ])
+            original_image = Image.open(args.input).convert('RGB')
+            original_image_np = np.array(original_image)
             input_tensor = transform(original_image).unsqueeze(0).to(device)
+            input_tensor.requires_grad = True
 
             # GradCAM needs the classifier (logit output), not the pooled feature
             # extractor — pull the wrapped torch model back out of the CNN adapter.
@@ -248,17 +211,15 @@ def predict_single_image(args, ensemble, feature_extractor, device):
                 colormap=cv2.COLORMAP_JET
             )
 
-            # Save visualization
-            output_dir = os.path.dirname(args.output) if args.output else "./"
-            base_name = os.path.splitext(os.path.basename(args.input))[0]
-            viz_path = os.path.join(output_dir, f"{base_name}_gradcam.jpg")
-            save_gradcam_results(cam, visualization, original_image_np, output_dir, base_name)
-            logger.info(f"GradCAM visualization saved to {viz_path}")
-
+            output_dir = args.output or os.path.dirname(args.input) or '.'
+            filename = os.path.splitext(os.path.basename(args.input))[0]
+            save_gradcam_results(cam, visualization, original_image_np, output_dir, filename)
+            logger.info(f"GradCAM visualization saved to {output_dir}")
         except Exception as e:
-            logger.warning(f"Could not generate GradCAM visualization: {e}")
+            logger.error(f"GradCAM generation failed: {e}", exc_info=True)
 
-    return prediction_label, confidence
+    return label, confidence
+
 
 def predict_batch(args, ensemble, feature_extractor, device):
     """Make predictions on a batch of images or directory."""
@@ -266,7 +227,6 @@ def predict_batch(args, ensemble, feature_extractor, device):
 
     if os.path.isdir(args.input):
         logger.info(f"Processing directory: {args.input}")
-        # Use batch inference engine
         inference_engine = BatchInferenceEngine(
             ensemble_model=ensemble,
             feature_extractor=feature_extractor,
@@ -274,7 +234,6 @@ def predict_batch(args, ensemble, feature_extractor, device):
             config_path=args.model_config
         )
 
-        # Load models into inference engine
         inference_engine.ensemble_model = ensemble
         inference_engine.ensemble_model.is_fitted = True
 
@@ -284,21 +243,17 @@ def predict_batch(args, ensemble, feature_extractor, device):
             return_features=False
         )
 
-        # Save results
         if args.output:
             inference_engine.save_results(results, args.output)
             logger.info(f"Batch results saved to {args.output}")
         else:
-            # Default output path
             output_path = os.path.join(os.path.dirname(args.input) or '.', 'predictions.csv')
             inference_engine.save_results(results, output_path)
             logger.info(f"Batch results saved to {output_path}")
 
         return results
     else:
-        # Treat as list of image files
         logger.info(f"Processing {len(args.input)} images")
-        # For simplicity, we'll process them individually
         results = []
         for image_path in args.input:
             if os.path.exists(image_path):
@@ -315,67 +270,53 @@ def predict_batch(args, ensemble, feature_extractor, device):
                 logger.warning(f"Image not found: {image_path}")
         return results
 
+
 def main():
     """Main prediction function."""
-    parser = argparse.ArgumentParser(description='Predict with Multi-model Deepfake Detection System')
+    parser = argparse.ArgumentParser(description='Run inference with Multi-model Deepfake Detection System')
 
-    # Input arguments
     parser.add_argument('--input', type=str, required=True,
-                       help='Input image file, directory, or list of image files')
+                       help='Path to input image, directory, or list of image paths')
+    parser.add_argument('--output', type=str,
+                       help='Path to save results (CSV for batch, directory for single-image GradCAM)')
     parser.add_argument('--model_dir', type=str, default='./models',
                        help='Directory containing trained models (default: ./models)')
     parser.add_argument('--model_config', type=str,
                        default=DEFAULT_CONFIG_PATH,
                        help='Path to model configuration YAML file')
-
-    # Output arguments
-    parser.add_argument('--output', type=str,
-                       help='Output file for predictions (JSON for single image, CSV for batch)')
+    parser.add_argument('--fold', type=int, default=1,
+                       help='Which fold\'s trained models to load, 1-indexed (default: 1). '
+                            'train.py saves each fold\'s models under a fold_N subfolder — '
+                            'pick whichever fold scored best in your evaluation_results.json, '
+                            'or just use fold 1 if you only trained a single fold.')
     parser.add_argument('--gradcam', action='store_true',
-                       help='Generate GradCAM visualization (for single image only)')
-
-    # Processing arguments
+                       help='Generate GradCAM visualization (single image only)')
+    parser.add_argument('--seed', type=int, default=42,
+                       help='Random seed (default: 42)')
     parser.add_argument('--verbose', action='store_true',
                        help='Enable verbose logging')
-    parser.add_argument('--log_file', type=str,
-                       help='Path to log file (optional)')
 
     args = parser.parse_args()
 
+    setup_logging(log_level="DEBUG" if args.verbose else "INFO")
+    logger = logging.getLogger(__name__)
+    set_seed(args.seed)
+    device = get_device()
+
     try:
-        # Setup environment
-        device = setup_environment(args)
-
-        logger = logging.getLogger(__name__)
-        logger.info("="*60)
-        logger.info("Multi-model Deepfake Detection Prediction Started")
-        logger.info("="*60)
-        logger.info(f"Input: {args.input}")
-        logger.info(f"Model directory: {args.model_dir}")
-        logger.info(f"Generate GradCAM: {args.gradcam}")
-        logger.info("="*60)
-
-        start_time = time.time()
-
-        # Load models
         ensemble, feature_extractor, device = load_models(args, device)
 
-        # Make predictions
         if os.path.isdir(args.input) or (hasattr(args.input, '__iter__') and not isinstance(args.input, str)):
-            # Batch prediction
             results = predict_batch(args, ensemble, feature_extractor, device)
         else:
-            # Single image prediction
             prediction, confidence = predict_single_image(args, ensemble, feature_extractor, device)
-
-        total_time = time.time() - start_time
-        logger.info("="*60)
-        logger.info(f"Prediction completed in {format_time(total_time)}")
-        logger.info("="*60)
+            print(f"\nPrediction: {prediction}")
+            print(f"Confidence: {confidence:.4f}\n")
 
     except Exception as e:
         logger.error(f"Prediction failed with error: {e}", exc_info=True)
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
